@@ -140,6 +140,40 @@ SocketIoEngine.prototype.step = function (requestSpec, ee) {
   }
 
   let f = function(context, callback) {
+    // Connect 
+    if(!context.sockets[namespace]) {
+      let target = this.config.target + namespace;
+      let tls = this.config.tls || {};
+
+      const socketioOpts = template(this.socketioOpts, context);
+      let options = _.extend(
+        {
+          query: {
+            token: context.token || "No Token"
+          }
+        },
+        socketioOpts, // templated
+        tls
+      );
+
+      let socket = io(target, options);
+      context.sockets[namespace] = socket;
+      wildcardPatch(socket);
+
+      socket.on('*', function () {
+        context.__receivedMessageCount++;
+      });
+
+      socket.once('connect', function() {
+        cb(null, socket);
+      });
+      socket.once('connect_error', function(err) {
+        cb(err, null);
+      });
+    } else {
+      return cb(null, context.sockets[namespace]);
+    }
+    
     // Only process emit requests; delegate the rest to the HTTP engine (or think utility)
     if (requestSpec.think) {
       return engineUtil.createThink(requestSpec, _.get(self.config, 'defaults.think', {}));
@@ -265,35 +299,7 @@ SocketIoEngine.prototype.step = function (requestSpec, ee) {
 
 SocketIoEngine.prototype.loadContextSocket = function(namespace, context, cb) {
   context.sockets = context.sockets || {};
-
-  if(!context.sockets[namespace]) {
-    let target = this.config.target + namespace;
-    let tls = this.config.tls || {};
-
-    const socketioOpts = template(this.socketioOpts, context);
-    let options = _.extend(
-      {},
-      socketioOpts, // templated
-      tls
-    );
-
-    let socket = io(target, options);
-    context.sockets[namespace] = socket;
-    wildcardPatch(socket);
-
-    socket.on('*', function () {
-      context.__receivedMessageCount++;
-    });
-
-    socket.once('connect', function() {
-      cb(null, socket);
-    });
-    socket.once('connect_error', function(err) {
-      cb(err, null);
-    });
-  } else {
-    return cb(null, context.sockets[namespace]);
-  }
+  return cb(null, {});
 };
 
 SocketIoEngine.prototype.closeContextSockets = function (context) {
