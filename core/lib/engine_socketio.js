@@ -140,22 +140,29 @@ SocketIoEngine.prototype.step = function (requestSpec, ee) {
   }
 
   let f = function(context, callback) {
+    const namespace = requestSpec.emit.namespace;
+
+    let outgoing = {
+      channel: template(requestSpec.emit.channel, context),
+      data: template(requestSpec.emit.data, context)
+    };
     // Connect 
     if(!context.sockets[namespace]) {
-      let target = this.config.target + namespace;
-      let tls = this.config.tls || {};
+      let target = self.config.target + namespace;
+      let tls = self.config.tls || {};
 
-      const socketioOpts = template(this.socketioOpts, context);
+      const socketioOpts = template(self.socketioOpts, context);
       let options = _.extend(
         {
           query: {
-            token: context.token || "No Token"
+            token: outgoing.data.token || "No Token"
           }
         },
         socketioOpts, // templated
         tls
       );
 
+      debug('options', options);
       let socket = io(target, options);
       context.sockets[namespace] = socket;
       wildcardPatch(socket);
@@ -165,13 +172,13 @@ SocketIoEngine.prototype.step = function (requestSpec, ee) {
       });
 
       socket.once('connect', function() {
-        cb(null, socket);
+        debug("connected");
       });
       socket.once('connect_error', function(err) {
-        cb(err, null);
+        debug(err);
       });
     } else {
-      return cb(null, context.sockets[namespace]);
+      debug("already connected");
     }
     
     // Only process emit requests; delegate the rest to the HTTP engine (or think utility)
@@ -189,11 +196,6 @@ SocketIoEngine.prototype.step = function (requestSpec, ee) {
     if (!(requestSpec.emit && requestSpec.emit.channel && socketio)) {
       return ee.emit('error', 'invalid arguments');
     }
-
-    let outgoing = {
-      channel: template(requestSpec.emit.channel, context),
-      data: template(requestSpec.emit.data, context)
-    };
 
     let endCallback = function (err, context, needEmit) {
       if (err) {
@@ -224,6 +226,7 @@ SocketIoEngine.prototype.step = function (requestSpec, ee) {
 
         // Acknowledge required so add callback to emit
         if (needEmit) {
+          debug("request", outgoing.data);
           socketio.emit(outgoing.channel, outgoing.data, ackCallback);
         } else {
           ackCallback();
@@ -231,6 +234,7 @@ SocketIoEngine.prototype.step = function (requestSpec, ee) {
       } else {
         // No acknowledge data is expected, so emit without a listener
         if (needEmit) {
+          debug("request", outgoing.data);
           socketio.emit(outgoing.channel, outgoing.data);
         }
         markEndTime(ee, context, startedAt);
@@ -248,6 +252,7 @@ SocketIoEngine.prototype.step = function (requestSpec, ee) {
       // Listen for the socket.io response on the specified channel
       let done = false;
       socketio.on(response.channel, function receive(data) {
+        debug("response", data);
         done = true;
         processResponse(ee, data, response, context, function(err) {
           if (!err) {
