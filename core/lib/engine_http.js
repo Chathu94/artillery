@@ -6,8 +6,11 @@
 
 const async = require('async');
 const _ = require('lodash');
+const MongoClient = require('mongodb').MongoClient;
+const ObjectId = require('mongodb').ObjectId;
 const request = require('request');
 const debug = require('debug')('http');
+const mdebug = require('debug')('mongo');
 const debugRequests = require('debug')('http:request');
 const debugResponse = require('debug')('http:response');
 const debugFullBody = require('debug')('http:full_body');
@@ -45,6 +48,130 @@ function HttpEngine(script) {
 
   this._httpAgent = new http.Agent(agentOpts);
   this._httpsAgent = new https.Agent(agentOpts);
+}
+
+function processResponse(ee, data, response, context, callback) {
+  // Do we have supplied data to validate?
+  if (response.data && !deepEqual(data, response.data)) {
+    debug(data);
+    let err = 'data is not valid';
+    ee.emit('error', err);
+    return callback(err, context);
+  }
+
+  // If no capture or match specified, then we consider it a success at this point...
+  if (!response.capture && !response.match) {
+    return callback(null, context);
+  }
+
+  // Construct the (HTTP) response...
+  let fauxResponse = {body: JSON.stringify(data)};
+
+  // Handle the capture or match clauses...
+  engineUtil.captureOrMatch(response, fauxResponse, context, function(err, result) {
+    // Were we unable to invoke captureOrMatch?
+    if (err) {
+      debug(data);
+      ee.emit('error', err);
+      return callback(err, context);
+    }
+
+    // Do we have any failed matches?
+    let failedMatches = _.filter(result.matches, (v, k) => {
+      return !v.success;
+    });
+
+    // How to handle failed matches?
+    if (failedMatches.length > 0) {
+      debug(failedMatches);
+      // TODO: Should log the details of the match somewhere
+      ee.emit('error', 'Failed match');
+      return callback(new Error('Failed match'), context);
+    } else {
+      // Emit match events...
+      _.each(result.matches, function(v, k) {
+        ee.emit('match', v.success, {
+          expected: v.expected,
+          got: v.got,
+          expression: v.expression
+        });
+      });
+
+      // Populate the context with captured values
+      _.each(result.captures, function(v, k) {
+        context.vars[k] = v;
+      });
+
+      // Replace the base object context
+      // Question: Should this be JSON object or String?
+      context.vars.$ = fauxResponse.body;
+
+      // Increment the success count...
+      context._successCount++;
+
+      return callback(null, context);
+    }
+  });
+}
+
+function markEndTime(ee, context, startedAt) {
+  let endedAt = process.hrtime(startedAt);
+  let delta = (endedAt[0] * 1e9) + endedAt[1];
+  ee.emit('response', delta, 0, context._uid);
+}
+
+HttpEngine.prototype.getMongoConnection = function(namespace, config, context) {
+  return new Promise((resolve, reject) => {
+    try {
+      if (!global.mconnections) global.mconnections = {};
+      if (global.mconnections[namespace]) {
+        mdebug('namespace is already defined');
+        const checkNReturn = function() {
+          mdebug('namespace ' + namespace + ' is' + (!global.mconnections[namespace].ready ? ' not': '') + ' ready');
+          if (global.mconnections[namespace].ready) return resolve(global.mconnections[namespace].con);
+          setTimeout(checkNReturn, 1000);
+        }
+        checkNReturn();
+      } else {
+        mdebug('namespace creating');
+        global.mconnections[namespace] = { ready: false };
+        const globalConfig = this.config.mongo;
+        config = _.extend(config, this.config.mongo);
+        config.opts = _.extend({ useNewUrlParser: true }, config.opts, this.config.mongo.opts);
+        const client = new MongoClient(config.connectionString, config.opts);
+        client.connect(err => {
+            if (err) throw err;
+            mdebug('new mongo connection ' + namespace);
+            global.mconnections[namespace] = { ready: true, con: client };
+            return resolve(client);
+          });
+      }
+    } catch (e) {
+      reject(e);
+    }
+  });
+}
+
+HttpEngine.prototype.encodeMongoArgs = function(obj, context) {
+  const self = this;
+  if (typeof obj !== 'object') return obj;
+  let o = {};
+  _.forOwn(obj, (value, key) => {
+    if (['$oid'].indexOf(key) > -1) {
+      o = ObjectId(template(value, context));
+    } else if (typeof value === "object") {
+      if (_.isArray(value)) {
+        o[key] = _.map(value, (o => {
+          return self.encodeMongoArgs(value, context);
+        }))
+      } else {
+        o[key] = self.encodeMongoArgs(value, context);
+      }
+    } else {
+      o = template(obj, context);
+    }
+  });
+  return o;
 }
 
 HttpEngine.prototype.createScenario = function(scenarioSpec, ee) {
@@ -142,6 +269,144 @@ HttpEngine.prototype.step = function step(requestSpec, ee, opts) {
       console.log(template(requestSpec.log, context));
       return process.nextTick(function() { callback(null, context); });
     };
+  }
+
+  if (requestSpec.mongo) {
+    return function(context, callback) {
+      try {
+        const namespace = template(requestSpec.mongo.namespace || 'default', context);
+        const dbName = template(requestSpec.mongo.db, context);
+        const collectionName = template(requestSpec.mongo.collection, context);
+        const func = template(requestSpec.mongo.function, context);
+        const isCallback = template(requestSpec.mongo.isCallback, context);
+        const toArray = template(requestSpec.mongo.toArray, context);
+        let args = requestSpec.mongo.args;
+
+        ee.emit('request');
+        let startedAt = process.hrtime();
+
+        const con = self.getMongoConnection(namespace, template(requestSpec.config, context), context);
+
+        const handleEnding = (d) => {
+          let response = {
+            data: template(requestSpec.mongo.response.data, context),
+            capture: template(requestSpec.mongo.response.capture, context),
+            match: template(requestSpec.mongo.response.match, context)
+          };
+
+          // Construct the (HTTP) response...
+          const fauxResponse = { body: JSON.stringify(d) };
+
+          engineUtil.captureOrMatch(
+              requestSpec.mongo.response,
+              fauxResponse,
+              context,
+              function captured(err, result) {
+                if (err) {
+                  // Run onError hooks and end the scenario:
+                  runOnErrorHooks(onErrorHandlers, config.processor, err, requestSpec.mongo, context, ee, function(asyncErr) {
+                    ee.emit('error', err.message);
+                    return callback(err, context);
+                  });
+                }
+
+                mdebug('captures and matches:');
+                mdebug(result.matches);
+                mdebug(result.captures);
+
+                // match and capture are strict by default:
+                let haveFailedMatches = _.some(result.matches, function(v, k) {
+                  return !v.success && v.strict !== false;
+                });
+
+                let haveFailedCaptures = _.some(result.captures, function(v, k) {
+                  return v === '';
+                });
+
+                if (haveFailedMatches || haveFailedCaptures) {
+                  // TODO: Emit the details of each failed capture/match
+                } else {
+                  _.each(result.matches, function(v, k) {
+                    ee.emit('match', v.success, {
+                      expected: v.expected,
+                      got: v.got,
+                      expression: v.expression,
+                      strict: v.strict
+                    });
+                  });
+
+                  _.each(result.captures, function(v, k) {
+                    context.vars[k] = v;
+                  });
+                }
+
+                // Now run afterResponse processors
+                let functionNames = _.concat(opts.afterResponse || [], requestSpec.mongo.afterResponse || []);
+                async.eachSeries(
+                  functionNames,
+                  function iteratee(functionName, next) {
+                    let processFunc = config.processor[functionName];
+                    processFunc(requestSpec.mongo, res, context, ee, function(err) {
+                      if (err) {
+                        return next(err);
+                      }
+                      return next(null);
+                    });
+                  }, function(err) {
+                    if (err) {
+                      debug(err);
+                      ee.emit('error', err.code || err.message);
+                      return callback(err, context);
+                    }
+
+                    if (haveFailedMatches || haveFailedCaptures) {
+                      // FIXME: This means only one error in the report even if multiple captures failed for the same request.
+                      return callback(new Error('Failed capture or match'), context);
+                    }
+                    markEndTime(ee, context, startedAt);
+                    return callback(err, context);
+                  });
+              });
+        };
+
+        con
+          .then(client => {
+            const db = client.db(dbName);
+            const collection = db.collection(collectionName);
+            if (!collection[func]) throw new Error("Invalid function name");
+            args = _.map(args, (a) => {
+              const encoded = self.encodeMongoArgs(a, context);
+              return encoded;
+            });
+            mdebug('executing query:');
+            mdebug('\tdatabase: ', dbName);
+            mdebug('\tcollection: ', collectionName);
+            mdebug('\tfunction: ', func);
+            mdebug('\targs: ', args);
+            if (isCallback) {
+              args.push((e, d) => {
+                if (e) throw e;
+                handleEnding(d);
+              });
+              collection[func].apply(collection, args);
+            } else {
+              let p = collection[func].apply(collection, args);
+              if (toArray) {
+                  p = p.toArray();
+              }
+              p.then(d => handleEnding(d))
+                .catch(e => {
+                  throw e;
+                });
+            }
+          })
+          .catch(e => { throw e });
+      } catch (e) {
+        mdebug(e);
+        ee.emit('error', err.message);
+        callback(e, context);
+      }
+    }
   }
 
   if (requestSpec.function) {
